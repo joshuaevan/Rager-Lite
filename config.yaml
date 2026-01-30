@@ -1,0 +1,59 @@
+# LlamaIndex RAG Document Processor Configuration
+# ================================================
+
+# Input/Output Paths
+# ------------------
+input_path: "./input"           # Folder containing source documents
+output_path: "./output"         # Folder for processed output files
+
+# Output Format
+# -------------
+# Options: "txt", "jsonl", "both"
+# - txt: Plain text files (one per document or chunk)
+# - jsonl: JSON Lines format with metadata
+# - both: Generate both formats
+output_format: "txt"
+
+# Chunking Settings
+# -----------------
+chunk_documents: true           # Split documents into smaller chunks
+chunk_size: 1024                # Target size per chunk (in characters)
+chunk_overlap: 200              # Overlap between chunks for context continuity
+csv_rows_per_chunk: 50          # Rows per chunk for CSV files (header preserved in each)
+
+# File Size Limits
+# ----------------
+# GPT knowledge base has a 20MB file limit
+# Files exceeding this will be split into parts
+max_file_size_mb: 19
+
+# Supported File Types
+# --------------------
+# Enable/disable processing for specific file types
+file_types:
+  pdf: true
+  docx: true
+  csv: true
+  txt: true
+  html: true
+  md: true
+
+# Processing Options
+# ------------------
+recursive: true                 # Search subdirectories for files
+include_metadata: true          # Include source file info in output
+
+# OpenAI Integration (Optional)
+# -----------------------------
+# Use OpenAI API to generate better file descriptions
+# Set your API key here or use OPENAI_API_KEY environment variable
+use_openai: false
+openai_api_key: ""              # Leave empty to use OPENAI_API_KEY env var
+openai_model: "gpt-5-mini"      # Model to use (gpt-5-mini is fast and cheap)
+openai_batch_size: 10           # Files per API call (reduces API calls by 90%)
+openai_file_types:              # File types to use AI descriptions for
+  - pdf                         # Complex documents benefit most from AI
+  - docx
+  - html
+  - md
+# Note: CSV and TXT files use basic descriptions by default (saves tokens)

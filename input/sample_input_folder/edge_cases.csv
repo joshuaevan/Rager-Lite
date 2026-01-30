@@ -1,0 +1,7 @@
+id,name,note,amount,tags
+1,"Widget, Large","Contains a comma, and a quote: ""wow""",1234.50,hardware;featured
+2,Café Press,"Unicode sample: café, crème brûlée",9.99,unicode;food
+3,Multiline,"This cell has a newline:
+Line 2
+Line 3",0.01,text;multiline
+4,EmptyFields,,,

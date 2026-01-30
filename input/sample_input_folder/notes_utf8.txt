@@ -1,0 +1,19 @@
+Tool Test Notes (UTF-8)
+====================
+
+This file includes:
+- ASCII text
+- Unicode: café, naïve, jalapeño, piñata, résumé
+- Symbols: © ® ™ ✓ ✗
+- Emojis: 😀 (some parsers struggle)
+- Mixed line endings: this file is LF.
+
+Paragraph with spacing.
+
+Key-Value lines:
+id=12345
+status=OK
+path=/var/log/app/service.log
+
+JSON-ish snippet:
+{"event":"login","user":"alice@example.com","ip":"203.0.113.42","ts":"2026-01-30T12:34:56Z"}

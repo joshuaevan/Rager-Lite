@@ -1,0 +1,37 @@
+# Environment files (contain secrets)
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# User input files (keep samples folder)
+input/*
+!input/.gitkeep
+!input/sample_input_folder/
+
+# Output runs (keep folder structure, ignore processed data)
+output/run_*/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Description cache
+.description_cache.json
+
+# Setup files
+get-pip.py
