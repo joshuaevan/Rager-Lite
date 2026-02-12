@@ -27,6 +27,7 @@ if sys.version_info >= (3, 13):
 
 import argparse
 import json
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
@@ -36,8 +37,11 @@ import yaml
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file (use script's directory for reliable path)
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+# Suppress noisy PDF parser warnings (e.g. "Ignoring wrong pointing object")
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
 
 from llama_index.core import SimpleDirectoryReader
 from llama_index.core.node_parser import SentenceSplitter
@@ -123,7 +127,12 @@ def load_config(config_path: str = "config.yaml") -> dict:
 
     # Check environment variable for API key
     if not default_config["openai_api_key"]:
-        default_config["openai_api_key"] = os.environ.get("OPENAI_API_KEY", "")
+        env_key = os.environ.get("OPENAI_API_KEY", "")
+        if env_key:
+            default_config["openai_api_key"] = env_key
+            print(f"  OpenAI API key loaded from environment ({env_key[:8]}...)")
+        else:
+            print("  Warning: No OpenAI API key found in config or environment")
 
     return default_config
 
@@ -262,6 +271,48 @@ def sanitize_filename(filename: str) -> str:
     return filename
 
 
+def normalize_whitespace(text: str, max_blank_lines: int = 2) -> str:
+    """Collapse excessive blank lines while preserving paragraph structure."""
+    import re
+    # Replace sequences of 3+ newlines with just 2 (one blank line)
+    pattern = r'\n{' + str(max_blank_lines + 2) + r',}'
+    replacement = '\n' * (max_blank_lines + 1)
+    return re.sub(pattern, replacement, text)
+
+
+def clean_pdf_text(text: str) -> str:
+    """Clean up common PDF extraction artifacts.
+    
+    Fixes:
+    - Word-per-line fragmentation (word\\n \\nword pattern from PDF layout)
+    - Double/multiple spaces collapsed to single space
+    - Trailing whitespace on lines
+    - Leading whitespace on lines (preserving paragraph indentation of 4+ spaces)
+    """
+    import re
+
+    # Fix word-per-line fragmentation: "word\n \nword" -> "word word"
+    # This is the most common PDF artifact where each word ends up on its own
+    # line separated by lines containing just whitespace
+    text = re.sub(r'\n \n', ' ', text)
+
+    # Also handle variant: line ending with space, then newline-only line, then content
+    # e.g. "word \n\nword" where trailing space + blank line = fragment
+    text = re.sub(r' \n\n(?=[a-z])', ' ', text)
+
+    # Collapse multiple spaces to single (common in PDF table-of-contents style lines)
+    text = re.sub(r'  +', ' ', text)
+
+    # Remove trailing whitespace on each line
+    text = re.sub(r' +$', '', text, flags=re.MULTILINE)
+
+    # Remove leading single spaces on lines (PDF alignment artifact)
+    # but preserve intentional indentation (2+ spaces, e.g. bullet sub-items)
+    text = re.sub(r'^( )(?! )', '', text, flags=re.MULTILINE)
+
+    return text
+
+
 def get_source_filename(item) -> str:
     """Extract source filename from document or node metadata."""
     metadata = getattr(item, "metadata", {}) or {}
@@ -319,8 +370,15 @@ def write_txt_output(items: list, output_path: Path, max_size_mb: float, is_chun
         content_parts = []
         original_ext = extensions.get(source_name, "")
 
+        # Check if source is a PDF (needs extra text cleanup)
+        is_pdf = original_ext == ".pdf"
+
         for idx, item in enumerate(source_items):
             text = getattr(item, "text", "") or getattr(item, "get_content", lambda: "")()
+
+            # Clean up PDF extraction artifacts (word-per-line fragmentation, etc.)
+            if is_pdf:
+                text = clean_pdf_text(text)
 
             if is_chunked and len(source_items) > 1:
                 header = f"--- Chunk {idx + 1}/{len(source_items)} ---\n"
@@ -329,6 +387,9 @@ def write_txt_output(items: list, output_path: Path, max_size_mb: float, is_chun
                 content_parts.append(text)
 
         full_content = "\n\n".join(content_parts)
+        
+        # Normalize whitespace - collapse excessive blank lines
+        full_content = normalize_whitespace(full_content)
 
         # Split if exceeds max size
         if len(full_content.encode("utf-8")) > max_size_bytes:
@@ -342,7 +403,7 @@ def write_txt_output(items: list, output_path: Path, max_size_mb: float, is_chun
                     if current_content:
                         filename = f"{safe_name}_part{part_num}.txt"
                         filepath = knowledge_dir / filename
-                        filepath.write_text(current_content, encoding="utf-8")
+                        filepath.write_text(normalize_whitespace(current_content), encoding="utf-8")
                         manifest.append({
                             "file": filename,
                             "source": source_name,
@@ -359,7 +420,7 @@ def write_txt_output(items: list, output_path: Path, max_size_mb: float, is_chun
             if current_content:
                 filename = f"{safe_name}_part{part_num}.txt"
                 filepath = knowledge_dir / filename
-                filepath.write_text(current_content, encoding="utf-8")
+                filepath.write_text(normalize_whitespace(current_content), encoding="utf-8")
                 manifest.append({
                     "file": filename,
                     "source": source_name,
@@ -390,16 +451,33 @@ def write_jsonl_output(items: list, output_path: Path, max_size_mb: float, is_ch
 
     max_size_bytes = int(max_size_mb * 1024 * 1024)
 
+    # Group by source to build manifest data
+    source_chunks = {}
+    source_extensions = {}
+
     records = []
     for idx, item in enumerate(items):
         text = getattr(item, "text", "") or getattr(item, "get_content", lambda: "")()
         metadata = getattr(item, "metadata", {}) or {}
 
+        source_file = metadata.get("file_name", "unknown")
+        source_name = Path(source_file).stem
+        source_ext = Path(source_file).suffix.lower()
+
+        # Apply PDF text cleanup
+        if source_ext == ".pdf":
+            text = clean_pdf_text(text)
+
+        # Track source info for manifest
+        if source_name not in source_chunks:
+            source_chunks[source_name] = 0
+            source_extensions[source_name] = source_ext
+        source_chunks[source_name] += 1
+
         record = {
             "id": idx,
             "text": text,
-            "source_file": metadata.get("file_name", "unknown"),
-            "file_path": metadata.get("file_path", ""),
+            "source_file": source_file,
             "file_type": metadata.get("file_type", ""),
         }
 
@@ -407,6 +485,16 @@ def write_jsonl_output(items: list, output_path: Path, max_size_mb: float, is_ch
             record["chunk_index"] = idx
 
         records.append(record)
+
+    # Build manifest data for JSONL output
+    manifest = []
+    for source_name, chunk_count in source_chunks.items():
+        manifest.append({
+            "file": "documents.jsonl",
+            "source": source_name,
+            "original_type": source_extensions[source_name],
+            "chunks": chunk_count,
+        })
 
     # Write JSONL, splitting if needed
     files_written = 0
@@ -436,7 +524,7 @@ def write_jsonl_output(items: list, output_path: Path, max_size_mb: float, is_ch
         filepath.write_text("".join(current_lines), encoding="utf-8")
         files_written += 1
 
-    return files_written, records
+    return files_written, manifest
 
 
 def generate_file_description(file_info: dict, use_openai: bool = False, api_key: str = "") -> str:
@@ -557,7 +645,7 @@ def generate_openai_descriptions(
 
         if not files_to_process:
             print("  All descriptions cached or skipped.")
-            return descriptions
+            return descriptions, token_usage
 
         print(f"  Processing {len(files_to_process)} files in {(len(files_to_process) + batch_size - 1) // batch_size} batch(es)...")
 
@@ -591,8 +679,7 @@ etc."""
                             "content": f"Generate descriptions for these {len(batch)} documents:{files_text}"
                         }
                     ],
-                    max_tokens=50 * len(batch),
-                    temperature=0.3,
+                    max_completion_tokens=50 * len(batch),
                 )
                 
                 # Track token usage
@@ -887,13 +974,16 @@ def main():
 
     if output_format in ["jsonl", "both"]:
         print("\nWriting JSONL output...")
-        files, _ = write_jsonl_output(
+        files, jsonl_manifest = write_jsonl_output(
             items,
             run_folder,
             config["max_file_size_mb"],
             is_chunked,
         )
         total_files += files
+        # Use JSONL manifest if no TXT manifest was generated
+        if not manifest_data:
+            manifest_data.extend(jsonl_manifest)
 
     # Build stats
     stats = {

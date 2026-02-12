@@ -6,25 +6,42 @@ Run with: streamlit run web_ui.py
 """
 
 import streamlit as st
-import os
-import json
-import shutil
-from pathlib import Path
-from datetime import datetime
-import subprocess
-import sys
 
-from dotenv import load_dotenv, set_key
-
-# Load environment variables from .env file
-load_dotenv()
-
-# Page config
+# Page config MUST be first Streamlit command
 st.set_page_config(
     page_title="Rager - Lite",
     page_icon="🎸",
     layout="wide",
 )
+
+import os
+import json
+import shutil
+from pathlib import Path
+from datetime import datetime
+import sys
+import io
+from contextlib import redirect_stdout
+
+from dotenv import load_dotenv, set_key
+
+# Load environment variables from .env file (use script's directory for reliable path)
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+# Import processing functions (suppress stdout during import to avoid warnings)
+with redirect_stdout(io.StringIO()):
+    from process_docs import (
+        load_config,
+        get_enabled_extensions,
+        load_documents,
+        chunk_documents,
+        create_run_folder,
+        write_txt_output,
+        write_jsonl_output,
+        generate_instructions,
+        write_manifest,
+        DESCRIPTION_CACHE_FILE,
+    )
 
 # Initialize session state
 if "processing" not in st.session_state:
@@ -92,31 +109,147 @@ def get_input_files(input_path: str) -> list:
     return files
 
 
-def run_processor(config: dict) -> str:
-    """Run the document processor."""
-    cmd = [sys.executable, "process_docs.py"]
+def run_processor_direct(ui_config: dict, progress_bar, status_text) -> dict:
+    """Run the document processor directly with progress updates."""
     
-    if config.get("input_path"):
-        cmd.extend(["--input", config["input_path"]])
-    if config.get("output_path"):
-        cmd.extend(["--output", config["output_path"]])
-    if config.get("output_format"):
-        cmd.extend(["--format", config["output_format"]])
-    if config.get("no_chunk"):
-        cmd.append("--no-chunk")
-    if config.get("use_openai"):
-        cmd.append("--use-openai")
-    if config.get("api_key"):
-        cmd.extend(["--api-key", config["api_key"]])
-    if config.get("ai_types"):
-        cmd.extend(["--ai-types", ",".join(config["ai_types"])])
-    if config.get("ai_batch_size"):
-        cmd.extend(["--ai-batch-size", str(config["ai_batch_size"])])
-    if config.get("clear_cache"):
-        cmd.append("--clear-cache")
+    # Build config from UI settings
+    config = load_config()
     
-    result = subprocess.run(cmd, capture_output=True, text=True, cwd=str(Path(__file__).parent))
-    return result.stdout + result.stderr
+    # Override with UI settings
+    config["input_path"] = ui_config.get("input_path", "./input")
+    config["output_path"] = ui_config.get("output_path", "./output")
+    config["output_format"] = ui_config.get("output_format", "txt")
+    config["chunk_documents"] = not ui_config.get("no_chunk", False)
+    config["chunk_size"] = ui_config.get("chunk_size", 1024)
+    config["chunk_overlap"] = ui_config.get("chunk_overlap", 200)
+    config["use_openai"] = ui_config.get("use_openai", False)
+    config["openai_api_key"] = ui_config.get("api_key", "")
+    config["openai_file_types"] = ui_config.get("ai_types", ["pdf", "docx", "html", "md"])
+    config["openai_batch_size"] = ui_config.get("ai_batch_size", 10)
+    
+    # File types from UI
+    config["file_types"] = ui_config.get("file_types", {
+        "pdf": True, "docx": True, "csv": True,
+        "txt": True, "html": True, "md": True
+    })
+    
+    # Clear cache if requested
+    if ui_config.get("clear_cache"):
+        cache_path = Path(config["output_path"]) / DESCRIPTION_CACHE_FILE
+        if cache_path.exists():
+            cache_path.unlink()
+    
+    result = {"success": False, "run_folder": None, "stats": {}, "token_usage": {}}
+    
+    try:
+        # Step 1: Load documents (20%)
+        status_text.text("Loading documents...")
+        progress_bar.progress(5)
+        
+        extensions = get_enabled_extensions(config["file_types"])
+        documents = load_documents(
+            config["input_path"],
+            config["recursive"],
+            extensions,
+        )
+        
+        if not documents:
+            status_text.text("No documents found.")
+            return result
+        
+        progress_bar.progress(20)
+        status_text.text(f"Loaded {len(documents)} document(s)")
+        
+        # Step 2: Create run folder (25%)
+        run_folder = create_run_folder(config["output_path"])
+        progress_bar.progress(25)
+        
+        # Step 3: Chunk documents (50%)
+        status_text.text("Chunking documents...")
+        if config["chunk_documents"]:
+            items = chunk_documents(
+                documents,
+                config["chunk_size"],
+                config["chunk_overlap"],
+                config.get("csv_rows_per_chunk", 50),
+            )
+            is_chunked = True
+        else:
+            items = documents
+            is_chunked = False
+        
+        progress_bar.progress(50)
+        status_text.text(f"Created {len(items)} chunk(s)")
+        
+        # Step 4: Write output files (80%)
+        status_text.text("Writing output files...")
+        output_format = config["output_format"]
+        manifest_data = []
+        total_files = 0
+        
+        if output_format in ["txt", "both"]:
+            files, manifest = write_txt_output(
+                items,
+                run_folder,
+                config["max_file_size_mb"],
+                is_chunked,
+            )
+            total_files += files
+            manifest_data.extend(manifest)
+        
+        progress_bar.progress(70)
+        
+        if output_format in ["jsonl", "both"]:
+            files, jsonl_manifest = write_jsonl_output(
+                items,
+                run_folder,
+                config["max_file_size_mb"],
+                is_chunked,
+            )
+            total_files += files
+            # Use JSONL manifest if no TXT manifest was generated
+            if not manifest_data:
+                manifest_data.extend(jsonl_manifest)
+        
+        progress_bar.progress(80)
+        
+        # Step 5: Generate instructions (90%)
+        status_text.text("Generating instructions...")
+        stats = {
+            "documents_processed": len(documents),
+            "chunks_created": len(items) if is_chunked else len(documents),
+            "output_files": total_files,
+            "chunking_enabled": is_chunked,
+        }
+        
+        instructions, token_usage = generate_instructions(
+            manifest_data,
+            stats,
+            documents,
+            config,
+        )
+        instructions_path = run_folder / "instructions.md"
+        instructions_path.write_text(instructions, encoding="utf-8")
+        
+        progress_bar.progress(90)
+        
+        # Step 6: Write manifest (100%)
+        status_text.text("Finalizing...")
+        write_manifest(run_folder, manifest_data, stats, token_usage)
+        
+        progress_bar.progress(100)
+        status_text.text("Processing complete!")
+        
+        result["success"] = True
+        result["run_folder"] = str(run_folder)
+        result["stats"] = stats
+        result["token_usage"] = token_usage or {}
+        
+    except Exception as e:
+        status_text.text(f"Error: {str(e)}")
+        result["error"] = str(e)
+    
+    return result
 
 
 def create_download_zip(run_path: str) -> bytes:
@@ -163,6 +296,10 @@ with st.sidebar:
     )
     
     chunk_enabled = st.checkbox("Enable Chunking", value=True, help="Split documents into smaller chunks")
+    
+    # Default values
+    chunk_size = 1024
+    chunk_overlap = 200
     
     if chunk_enabled:
         chunk_size = st.slider("Chunk Size", min_value=256, max_value=4096, value=1024, step=128)
@@ -268,29 +405,48 @@ with tab1:
     
     # Process button
     if st.button("Process Documents", type="primary", disabled=len(input_files) == 0):
-        with st.spinner("Processing documents..."):
-            config = {
-                "input_path": input_path,
-                "output_path": output_path,
-                "output_format": output_format,
-                "no_chunk": not chunk_enabled,
-                "use_openai": use_openai,
-                "api_key": api_key if use_openai else "",
-                "ai_types": ai_types if use_openai else [],
-                "ai_batch_size": ai_batch_size if use_openai else 10,
-                "clear_cache": clear_cache if use_openai else False,
-            }
-            
-            output = run_processor(config)
-            
-            st.text_area("Processing Output", output, height=300)
-            
+        # Build file types config from checkboxes
+        file_types = {
+            "pdf": ft_pdf, "docx": ft_docx, "csv": ft_csv,
+            "txt": ft_txt, "html": ft_html, "md": ft_md
+        }
+        
+        config = {
+            "input_path": input_path,
+            "output_path": output_path,
+            "output_format": output_format,
+            "no_chunk": not chunk_enabled,
+            "chunk_size": chunk_size if chunk_enabled else 1024,
+            "chunk_overlap": chunk_overlap if chunk_enabled else 200,
+            "use_openai": use_openai,
+            "api_key": api_key if use_openai else "",
+            "ai_types": ai_types if use_openai else [],
+            "ai_batch_size": ai_batch_size if use_openai else 10,
+            "clear_cache": clear_cache if use_openai else False,
+            "file_types": file_types,
+        }
+        
+        # Create progress bar and status text
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Run processing directly
+        result = run_processor_direct(config, progress_bar, status_text)
+        
+        if result["success"]:
             # Get latest run
             runs = get_runs(output_path)
             if runs:
                 st.session_state.last_run = runs[0]
-                st.success(f"Processing complete! Output saved to: {runs[0]['path']}")
+                st.success(f"Processing complete! Output saved to: {result['run_folder']}")
+                
+                # Show token usage if any
+                if result.get("token_usage") and result["token_usage"].get("total_tokens"):
+                    st.info(f"OpenAI tokens used: {result['token_usage']['total_tokens']:,}")
+                
                 st.rerun()
+        else:
+            st.error(f"Processing failed: {result.get('error', 'Unknown error')}")
     
     # Show last run results
     if st.session_state.last_run:
